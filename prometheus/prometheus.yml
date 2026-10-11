@@ -1,0 +1,25 @@
+# Prometheus is the TSDB + rule engine. Almost all data arrives via
+# remote_write from Alloy; Prometheus only scrapes itself and Alloy directly
+# (meta-monitoring: if Alloy dies, this is how we find out).
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    project: planet-pulse
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alloy-direct
+    static_configs:
+      - targets: ["alloy:12345"]

@@ -1,0 +1,8 @@
+[
+  {"targets": ["json-exporter:7979"], "labels": {"city": "Poznań",    "country": "PL", "lat": "52.41",  "lon": "16.93"}},
+  {"targets": ["json-exporter:7979"], "labels": {"city": "Warszawa",  "country": "PL", "lat": "52.23",  "lon": "21.01"}},
+  {"targets": ["json-exporter:7979"], "labels": {"city": "Reykjavík", "country": "IS", "lat": "64.15",  "lon": "-21.94"}},
+  {"targets": ["json-exporter:7979"], "labels": {"city": "New York",  "country": "US", "lat": "40.71",  "lon": "-74.01"}},
+  {"targets": ["json-exporter:7979"], "labels": {"city": "Tokyo",     "country": "JP", "lat": "35.68",  "lon": "139.69"}},
+  {"targets": ["json-exporter:7979"], "labels": {"city": "Sydney",    "country": "AU", "lat": "-33.87", "lon": "151.21"}}
+]

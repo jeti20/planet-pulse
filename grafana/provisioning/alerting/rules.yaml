@@ -1,0 +1,257 @@
+# Grafana-managed alert rules - things happening on (and above) the planet.
+# Pattern for every rule:  A = PromQL,  B = reduce(last),  C = threshold.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: earth
+    folder: Planet Pulse
+    interval: 1m
+    rules:
+      # One alert instance per earthquake (multi-dimensional alerting).
+      - uid: pp-quake-strong
+        title: Strong earthquake
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (id, place, lat, lon) (usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"})
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [5.95]}
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: warning
+          category: earthquake
+        annotations:
+          summary: 'M{{ printf "%.1f" $values.B.Value }} earthquake - {{ $labels.place }}'
+          description: 'https://earthquake.usgs.gov/earthquakes/eventpage/{{ $labels.id }}'
+          __dashboardUid__: pp-earthquakes
+          __panelId__: "2"
+
+      - uid: pp-quake-tsunami
+        title: Earthquake with tsunami flag
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (id, place) (usgs_earthquake_tsunami{dataset="earthquakes_m2.5_day"})
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: critical
+          category: earthquake
+        annotations:
+          summary: 'Tsunami flag set for earthquake {{ $labels.place }}'
+          description: >-
+            USGS flags this event for possible tsunami (this is NOT a tsunami warning - check
+            https://www.tsunami.gov). Event: https://earthquake.usgs.gov/earthquakes/eventpage/{{ $labels.id }}
+          __dashboardUid__: pp-earthquakes
+          __panelId__: "2"
+
+  - orgId: 1
+    name: space-weather
+    folder: Planet Pulse
+    interval: 1m
+    rules:
+      # Hysteresis: fires at Kp >= 5 (G1), resolves only when Kp drops below 4.
+      # space:kp:max30m bridges the reset of the 1-minute estimate every 3 hours.
+      - uid: pp-geomagnetic-storm
+        title: Geomagnetic storm
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'space:kp:max30m'}
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gte, params: [5]}
+                  unloadEvaluator: {type: lt, params: [4]}
+        noDataState: NoData
+        execErrState: Error
+        for: 15m
+        keepFiringFor: 30m
+        labels:
+          severity: warning
+          category: space
+        annotations:
+          summary: 'Geomagnetic storm: Kp {{ printf "%.2f" $values.B.Value }}'
+          description: Aurora may be visible far from the poles tonight. Check the Space Weather dashboard.
+          __dashboardUid__: pp-space
+          __panelId__: "2"
+
+      - uid: pp-solar-flare
+        title: Strong solar flare
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: space:xray_flare_class:level}
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gte, params: [3]}
+        noDataState: NoData
+        execErrState: Error
+        for: 0s
+        keepFiringFor: 15m
+        labels:
+          severity: warning
+          category: space
+        annotations:
+          summary: 'Solar flare in progress: {{ if ge $values.B.Value 4.0 }}X{{ else }}M{{ end }}-class'
+          description: Expect HF radio blackouts on the sunlit side of the Earth (NOAA R-scale).
+          __dashboardUid__: pp-space
+          __panelId__: "2"
+
+  - orgId: 1
+    name: weather
+    folder: Planet Pulse
+    interval: 5m
+    rules:
+      - uid: pp-air-quality
+        title: Poor air quality
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'max by (city) (openmeteo_air_european_aqi)'}
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [80]}
+                  unloadEvaluator: {type: lt, params: [60]}
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels:
+          severity: info
+          category: weather
+        annotations:
+          summary: '{{ $labels.city }}: very poor air quality (European AQI {{ printf "%.0f" $values.B.Value }})'
+          description: Reduce outdoor activity. Source - Open-Meteo / CAMS.
+          __dashboardUid__: pp-weather
+          __panelId__: "2"
+
+      - uid: pp-wind-gusts
+        title: Strong wind gusts
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'max by (city) (openmeteo_weather_wind_gusts_kmh)'}
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [75]}
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels:
+          severity: info
+          category: weather
+        annotations:
+          summary: '{{ $labels.city }}: wind gusts {{ printf "%.0f" $values.B.Value }} km/h'
+          __dashboardUid__: pp-weather
+          __panelId__: "2"
+
+  # Grafana can alert on Prometheus recording rules too - here an SLO
+  # "early warning" before the 30-day budget is gone.
+  - orgId: 1
+    name: slo
+    folder: Planet Pulse
+    interval: 5m
+    rules:
+      - uid: pp-error-budget-low
+        title: Error budget below 25%
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: slo:error_budget_remaining:ratio}
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: lt, params: [0.25]}
+        noDataState: OK
+        execErrState: Error
+        for: 30m
+        labels:
+          severity: info
+          category: slo
+        annotations:
+          summary: '{{ $labels.provider }}/{{ $labels.slo }}: {{ humanizePercentage $values.B.Value }} of the error budget left'
+          description: Consider freezing risky changes (see docs/error-budget-policy.md).
+          __dashboardUid__: pp-slo
+          __panelId__: "2"

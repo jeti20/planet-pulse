@@ -1,0 +1,127 @@
+# =============================================================================
+# Meta-monitoring: is the monitoring itself healthy?
+# =============================================================================
+
+groups:
+
+  - name: meta-alerts
+    rules:
+      # Always firing. If it stops arriving in ntfy, the alerting pipeline is broken.
+      # pint disable alerts/comparison
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: Alerting pipeline heartbeat (always firing)
+          description: >-
+            This alert is always firing. Route it to a dead man's switch; if it ever goes silent,
+            Prometheus -> Alertmanager -> receiver is broken.
+
+      - alert: StackComponentDown
+        expr: up{job=~"prometheus|alloy-direct|json-exporter|loki|alertmanager|grafana|ntfy"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }} is down"
+          description: "{{ $labels.job }} ({{ $labels.instance }}) has not been scrapeable for 2 minutes."
+          runbook_url: docs/runbooks.md#stackcomponentdown
+
+      # Prometheus scrapes Alloy directly; this catches "Alloy up, but nothing
+      # reaches Prometheus" (remote_write broken, pipeline misconfigured...).
+      - alert: NoUpstreamDataReceived
+        expr: absent_over_time(up{job="upstream"}[5m])
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: No upstream scrape results received from Alloy for 5 minutes
+          description: Check Alloy remote_write and the Alloy UI at http://localhost:12345.
+          runbook_url: docs/runbooks.md#noupstreamdatareceived
+
+      - alert: AlloyRemoteWriteFailing
+        expr: sum by (instance) (rate(prometheus_remote_storage_samples_failed_total{job="alloy"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Alloy fails to remote_write samples to Prometheus
+          description: "{{ $value | humanize }} samples/s are failing."
+
+      # Per-target symptom. Deliberately a ticket: the availability SLO decides
+      # whether a human is paged.
+      - alert: UpstreamScrapeFailing
+        expr: avg_over_time(up{job="upstream"}[15m]) < 0.5
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Upstream {{ $labels.instance }} fails more than half of the scrapes"
+          description: "Provider {{ $labels.provider }}, dataset {{ $labels.dataset }}."
+          runbook_url: docs/runbooks.md#upstreamscrapefailing
+
+      # The HTTP call works, but none of our JSONPaths matched any more - the
+      # provider changed the schema of the payload (a "data contract" check).
+      - alert: UpstreamSchemaDrift
+        expr: |
+          up{job="upstream"} == 1
+          and on (instance)
+          scrape_samples_post_metric_relabeling{job="upstream"} == 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} returns data, but no metrics can be extracted"
+          description: >-
+            The endpoint answers with HTTP 200 but json-exporter extracted (almost) nothing.
+            The payload format of {{ $labels.provider }}/{{ $labels.dataset }} has probably changed.
+          runbook_url: docs/runbooks.md#upstreamschemadrift
+
+      # Data-quality check: the request works and parses, but the values are
+      # physically impossible (the X-ray background never drops to exactly 0).
+      - alert: UpstreamDataInvalid
+        expr: max by (provider, dataset) (swpc_xray_flux_wm2{energy="0.1-0.8nm"}) == 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.provider }}/{{ $labels.dataset }} reports physically impossible values (flux = 0)"
+          description: >-
+            GOES X-ray flux has been exactly 0 for 30 minutes - a data gap on the provider side
+            (satellite manoeuvre, eclipse season, calibration). Flare class is shown as "no data".
+          runbook_url: docs/runbooks.md#upstreamdatainvalid
+
+      - alert: UpstreamTLSCertificateExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry{job="synthetics"} - time()) / 86400 < 14
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "TLS certificate of {{ $labels.provider }} expires in {{ $value | printf \"%.0f\" }} days"
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Rule group {{ $labels.rule_group }} fails to evaluate"
+
+      - alert: AlertmanagerNotificationsFailing
+        expr: sum by (integration) (rate(alertmanager_notifications_failed_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Alertmanager cannot deliver notifications via {{ $labels.integration }}"
+          runbook_url: docs/runbooks.md#alertmanagernotificationsfailing
+
+      # Log-derived metric produced by Alloy's loki.process stage.metrics.
+      - alert: ErrorLogsSpike
+        expr: sum by (service) (rate(loki_process_custom_log_lines_total{level="error"}[10m])) * 60 > 5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.service }} logs {{ $value | printf \"%.1f\" }} errors/min"
+          description: Explore the logs in Grafana -> Explore -> Loki, {service="{{ $labels.service }}", level="error"}.

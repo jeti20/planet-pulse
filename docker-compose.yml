@@ -1,0 +1,185 @@
+# Planet Pulse - observability for planet Earth (and for the APIs that watch it).
+#
+#   USGS / NOAA SWPC / Open-Meteo  --HTTP-->  json-exporter  <--scrape--  Alloy --remote_write--> Prometheus
+#                                  <--probe-- Alloy (built-in blackbox)                                |
+#   docker logs  --> Alloy --> Loki                                         rules / SLOs / alerts <----+
+#   Prometheus --> Alertmanager --> ntfy          Grafana (dashboards, Grafana-managed alerts) --> ntfy
+
+name: planet-pulse
+
+# Security defaults: every published port is bound to 127.0.0.1 (override with
+# BIND_ADDR in .env only if you know what you are doing - Grafana allows
+# anonymous editing and Prometheus/Alertmanager/ntfy have no authentication).
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  json-exporter:
+    image: prometheuscommunity/json-exporter:v0.8.0
+    command: ["--config.file=/etc/json-exporter/config.yml"]
+    volumes:
+      - ./json-exporter/config.yml:/etc/json-exporter/config.yml:ro
+    restart: unless-stopped
+    logging: *logging
+
+  alloy:
+    image: grafana/alloy:v1.20.1
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --stability.level=generally-available
+      - /etc/alloy/config.alloy
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:12345:12345"
+    volumes:
+      - ./alloy:/etc/alloy:ro
+      - alloy_data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [json-exporter, prometheus, loki]
+    restart: unless-stopped
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=45d
+      - --web.enable-remote-write-receiver
+      - --web.enable-lifecycle
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    logging: *logging
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://localhost:9093
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:9093:9093"
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+    restart: unless-stopped
+    logging: *logging
+
+  loki:
+    image: grafana/loki:3.7.8
+    command: ["-config.file=/etc/loki/loki.yml"]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:3100:3100"
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+    logging: *logging
+
+  ntfy:
+    image: binwiederhier/ntfy:v2.29.0
+    command: ["serve"]
+    environment:
+      NTFY_BASE_URL: http://localhost:8080
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+      NTFY_CACHE_DURATION: 72h
+      NTFY_ENABLE_METRICS: "true"
+      NTFY_BEHIND_PROXY: "false"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8080:80"
+    volumes:
+      - ntfy_cache:/var/cache/ntfy
+    restart: unless-stopped
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      # Anonymous access, Editor by default so dashboards can be changed in the UI
+      # without logging in. Set GF_ANONYMOUS_ROLE=Viewer (or disable) before exposing Grafana.
+      GF_AUTH_ANONYMOUS_ENABLED: ${GF_ANONYMOUS_ENABLED:-true}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: ${GF_ANONYMOUS_ROLE:-Editor}
+      GF_USERS_DEFAULT_THEME: dark
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/Planet Pulse/home.json
+      GF_PLUGINS_PREINSTALL_SYNC: yesoreyeram-infinity-datasource
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Server-side rendering: PNG export of panels (also used for docs/img screenshots).
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+      GF_RENDERING_RENDERER_TOKEN: ${GF_RENDERER_TOKEN:-change-me-renderer-token}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on: [prometheus, loki, alertmanager, renderer]
+    restart: unless-stopped
+    logging: *logging
+
+  renderer:
+    image: grafana/grafana-image-renderer:v5.12.6
+    environment:
+      AUTH_TOKEN: ${GF_RENDERER_TOKEN:-change-me-renderer-token}
+    restart: unless-stopped
+    logging: *logging
+
+  # --------------------------------------------------------------------------
+  # Tooling (not started by `docker compose up`):
+  #   docker compose run --rm promtool check config /etc/prometheus/prometheus.yml
+  #   docker compose run --rm promtool test rules /etc/prometheus/tests/slo_test.yml
+  #   docker compose run --rm pint
+  # --------------------------------------------------------------------------
+  promtool:
+    image: prom/prometheus:v3.15.0
+    profiles: [tools]
+    entrypoint: ["promtool"]
+    working_dir: /etc/prometheus
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+
+  amtool:
+    image: prom/alertmanager:v0.34.1
+    profiles: [tools]
+    entrypoint: ["amtool"]
+    command: ["check-config", "/etc/alertmanager/alertmanager.yml"]
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+
+  pint:
+    image: ghcr.io/cloudflare/pint:0.89.0
+    profiles: [tools]
+    command: ["pint", "--config=/work/.pint.hcl", "--no-color", "lint", "/work/prometheus/rules"]
+    volumes:
+      - ./:/work:ro
+
+  alloy-validate:
+    image: grafana/alloy:v1.20.1
+    profiles: [tools]
+    entrypoint: ["/bin/alloy"]
+    command: ["validate", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./alloy:/etc/alloy:ro
+
+volumes:
+  alloy_data:
+  prometheus_data:
+  alertmanager_data:
+  loki_data:
+  ntfy_cache:
+  grafana_data:

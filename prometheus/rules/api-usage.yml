@@ -1,0 +1,183 @@
+# =============================================================================
+# API usage: how many HTTP requests do we actually send to each provider?
+#
+# Nothing here estimates - every request leaves a sample behind:
+#   json-exporter   1 scrape of job="upstream"          = 1 request  -> count_over_time(up[w])
+#   Alloy blackbox  1 probe of job="synthetics"          = 1 request  -> count_over_time(probe_success[w])
+#   Grafana         1 Infinity query (SWPC bulletins)     = 1 request  -> increase(grafana_plugin_request_total[w])
+#
+# If Alloy or Prometheus is down, no scrapes happen, so no requests are sent
+# either - the counts stay exact across outages.
+#
+# Series (labels: provider, dataset, caller):
+#   upstream:http_calls:count{1m,5m,1h,24h}          requests in the window
+#   upstream:http_calls_failed:count{1h,24h}         of which failed
+#   upstream:api_quota:calls{provider, window}       published free-tier limits
+#   upstream:api_quota_usage:ratio{provider, window} usage / limit
+# =============================================================================
+
+# Usage/quota rules read counts produced by groups with other intervals
+# (24 h windows are evaluated less often) - cross-group dependencies are intended.
+# pint file/disable rule/dependency
+
+groups:
+
+  - name: api-usage-short
+    interval: 1m
+    rules:
+      # --- requests per window ------------------------------------------------
+      - record: upstream:http_calls:count1m
+        expr: sum by (provider, dataset) (count_over_time(up{job="upstream"}[1m]))
+        labels:
+          caller: json-exporter
+      - record: upstream:http_calls:count1m
+        expr: |
+          label_replace(
+            sum by (provider) (count_over_time(probe_success{job="synthetics"}[1m])),
+            "dataset", "synthetic_probe", "", ""
+          )
+        labels:
+          caller: alloy-blackbox
+
+      - record: upstream:http_calls:count1h
+        expr: sum by (provider, dataset) (count_over_time(up{job="upstream"}[1h]))
+        labels:
+          caller: json-exporter
+      - record: upstream:http_calls:count1h
+        expr: |
+          label_replace(
+            sum by (provider) (count_over_time(probe_success{job="synthetics"}[1h])),
+            "dataset", "synthetic_probe", "", ""
+          )
+        labels:
+          caller: alloy-blackbox
+      # The only Infinity panel reads https://services.swpc.noaa.gov/products/alerts.json,
+      # once per dashboard load/refresh.
+      - record: upstream:http_calls:count1h
+        expr: |
+          label_replace(label_replace(
+            round(sum(increase(grafana_plugin_request_total{plugin_id="yesoreyeram-infinity-datasource", endpoint="queryData"}[1h]))),
+            "provider", "swpc", "", ""), "dataset", "alerts_bulletins", "", "")
+        labels:
+          caller: grafana-infinity
+
+      # --- failed requests (HTTP error, timeout, 429, unparseable body) -------
+      - record: upstream:http_calls_failed:count1h
+        expr: |
+          sum by (provider, dataset) (count_over_time(up{job="upstream"}[1h]))
+          - sum by (provider, dataset) (sum_over_time(up{job="upstream"}[1h]))
+        labels:
+          caller: json-exporter
+      - record: upstream:http_calls_failed:count1h
+        expr: |
+          label_replace(
+              sum by (provider) (count_over_time(probe_success{job="synthetics"}[1h]))
+            - sum by (provider) (sum_over_time(probe_success{job="synthetics"}[1h])),
+            "dataset", "synthetic_probe", "", ""
+          )
+        labels:
+          caller: alloy-blackbox
+
+  - name: api-usage-long
+    interval: 5m
+    rules:
+      - record: upstream:http_calls:count24h
+        expr: sum by (provider, dataset) (count_over_time(up{job="upstream"}[24h]))
+        labels:
+          caller: json-exporter
+      - record: upstream:http_calls:count24h
+        expr: |
+          label_replace(
+            sum by (provider) (count_over_time(probe_success{job="synthetics"}[24h])),
+            "dataset", "synthetic_probe", "", ""
+          )
+        labels:
+          caller: alloy-blackbox
+      - record: upstream:http_calls:count24h
+        expr: |
+          label_replace(label_replace(
+            round(sum(increase(grafana_plugin_request_total{plugin_id="yesoreyeram-infinity-datasource", endpoint="queryData"}[24h]))),
+            "provider", "swpc", "", ""), "dataset", "alerts_bulletins", "", "")
+        labels:
+          caller: grafana-infinity
+
+      - record: upstream:http_calls_failed:count24h
+        expr: |
+          sum by (provider, dataset) (count_over_time(up{job="upstream"}[24h]))
+          - sum by (provider, dataset) (sum_over_time(up{job="upstream"}[24h]))
+        labels:
+          caller: json-exporter
+      - record: upstream:http_calls_failed:count24h
+        expr: |
+          label_replace(
+              sum by (provider) (count_over_time(probe_success{job="synthetics"}[24h]))
+            - sum by (provider) (sum_over_time(probe_success{job="synthetics"}[24h])),
+            "dataset", "synthetic_probe", "", ""
+          )
+        labels:
+          caller: alloy-blackbox
+
+  # ---------------------------------------------------------------------------
+  # Quotas. Only Open-Meteo publishes hard limits for its free tier
+  # (non-commercial, per IP). USGS and SWPC ask for "reasonable" use, so
+  # there's nothing to compare against.
+  # ---------------------------------------------------------------------------
+  - name: api-quota
+    interval: 1m
+    rules:
+      - record: upstream:api_quota:calls
+        expr: vector(10000)
+        labels: {provider: openmeteo, window: 1d}
+      - record: upstream:api_quota:calls
+        expr: vector(5000)
+        labels: {provider: openmeteo, window: 1h}
+      - record: upstream:api_quota:calls
+        expr: vector(600)
+        labels: {provider: openmeteo, window: 1m}
+
+      - record: upstream:api_quota_usage:ratio
+        expr: |
+          sum by (provider) (upstream:http_calls:count24h)
+          / on (provider) upstream:api_quota:calls{window="1d"}
+        labels:
+          window: 1d
+      - record: upstream:api_quota_usage:ratio
+        expr: |
+          sum by (provider) (upstream:http_calls:count1h)
+          / on (provider) upstream:api_quota:calls{window="1h"}
+        labels:
+          window: 1h
+      - record: upstream:api_quota_usage:ratio
+        expr: |
+          sum by (provider) (upstream:http_calls:count1m)
+          / on (provider) upstream:api_quota:calls{window="1m"}
+        labels:
+          window: 1m
+
+  - name: api-usage-alerts
+    rules:
+      - alert: UpstreamApiQuotaNearlyExhausted
+        expr: upstream:api_quota_usage:ratio > 0.8
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.provider }} uses {{ $value | humanizePercentage }} of its {{ $labels.window }} API quota"
+          description: >-
+            At 100 % the provider answers HTTP 429 and its SLOs start burning. Reduce the number of
+            targets (alloy/cities.json) or increase scrape_interval in alloy/config.alloy.
+          runbook_url: docs/runbooks.md#upstreamapiquotanearlyexhausted
+
+      # The synthetic probe sees the real HTTP status, so "rate limited" can be
+      # told apart from "provider is down".
+      - alert: UpstreamRateLimited
+        expr: max by (provider) (probe_http_status_code{job="synthetics"}) == 429
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.provider }} is rate-limiting us (HTTP 429)"
+          description: >-
+            The API quota is exhausted - this is the cause of the availability/freshness SLO burn for
+            {{ $labels.provider }}. See the API usage dashboard.
+          runbook_url: docs/runbooks.md#upstreamratelimited

@@ -1,0 +1,57 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      prometheusType: Prometheus
+      prometheusVersion: 3.15.0
+      httpMethod: POST
+      timeInterval: 30s
+      # incrementalQuerying is off on purpose: it cached an empty result for a
+      # brand-new recording rule and kept showing "no data" (see README).
+      incrementalQuerying: false
+      cacheLevel: Medium
+      manageAlerts: true
+      alertmanagerUid: alertmanager
+    # Correlations: jump from a Prometheus series to the logs of the same service.
+    correlations:
+      - targetUID: loki
+        label: Logs of this service
+        description: Container logs (Loki) for the job/service in this series
+        type: query
+        config:
+          field: job
+          target:
+            expr: '{service="$${job}"}'
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      maxLines: 1000
+
+  - name: Alertmanager
+    uid: alertmanager
+    type: alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    jsonData:
+      implementation: prometheus
+      handleGrafanaManagedAlerts: false
+
+  # Infinity reads JSON straight from public APIs at query time - used for
+  # text data that does not belong in a TSDB (SWPC alert bulletins).
+  - name: Infinity
+    uid: infinity
+    type: yesoreyeram-infinity-datasource
+    jsonData:
+      allowedHosts:
+        - https://services.swpc.noaa.gov
+        - https://earthquake.usgs.gov

@@ -1,0 +1,138 @@
+# Unit tests for domain + meta rules:  docker compose run --rm promtool test rules tests/domain_test.yml
+rule_files:
+  - ../rules/earth.yml
+  - ../rules/meta.yml
+
+evaluation_interval: 1m
+
+tests:
+
+  - name: earthquake aggregations
+    interval: 1m
+    input_series:
+      - series: 'usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day", id="a", place="12 km SW of Hope, Alaska"}'
+        values: '3x10'
+      - series: 'usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day", id="b", place="100 km E of Nikolski, Alaska"}'
+        values: '6x10'
+      - series: 'usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day", id="c", place="Kermadec Islands region"}'
+        values: '7.2x10'
+    promql_expr_test:
+      - expr: earth:earthquakes:count24h
+        eval_time: 5m
+        exp_samples:
+          - labels: earth:earthquakes:count24h
+            value: 3
+      - expr: earth:earthquakes_by_class:count24h
+        eval_time: 5m
+        exp_samples:
+          - {labels: 'earth:earthquakes_by_class:count24h{class="M2.5-4.4"}', value: 1}
+          - {labels: 'earth:earthquakes_by_class:count24h{class="M4.5-5.9"}', value: 0}
+          - {labels: 'earth:earthquakes_by_class:count24h{class="M6.0-6.9"}', value: 1}
+          - {labels: 'earth:earthquakes_by_class:count24h{class="M7+"}', value: 1}
+      - expr: earth:earthquakes_by_region:count24h
+        eval_time: 5m
+        exp_samples:
+          - {labels: 'earth:earthquakes_by_region:count24h{region="Alaska"}', value: 2}
+          - {labels: 'earth:earthquakes_by_region:count24h{region="Kermadec Islands region"}', value: 1}
+      # Energy is dominated by the largest quake: one M7.2 ~ 60x one M6.
+      - expr: round(earth:earthquake_energy_tnt_tonnes:sum24h)
+        eval_time: 5m
+        exp_samples:
+          - value: 966580   # (10^9.3 + 10^13.8 + 10^15.6 J) / 4.184e9 J per tonne of TNT
+
+  - name: empty feed still yields zero
+    interval: 1m
+    input_series:
+      - series: 'up{job="upstream"}'
+        values: '1x5'
+    promql_expr_test:
+      - expr: earth:earthquakes:count24h
+        eval_time: 2m
+        exp_samples:
+          - labels: earth:earthquakes:count24h
+            value: 0
+
+  - name: solar flare class
+    interval: 1m
+    input_series:
+      - series: 'swpc_xray_flux_wm2{energy="0.1-0.8nm", satellite="18"}'
+        values: '3e-8 4e-7 2.5e-6 1.2e-5 3e-4 1e-2 0'
+    promql_expr_test:
+      - {expr: space:xray_flare_class:level, eval_time: 0m, exp_samples: [{labels: space:xray_flare_class:level, value: 0}]}  # A
+      - {expr: space:xray_flare_class:level, eval_time: 1m, exp_samples: [{labels: space:xray_flare_class:level, value: 1}]}  # B
+      - {expr: space:xray_flare_class:level, eval_time: 2m, exp_samples: [{labels: space:xray_flare_class:level, value: 2}]}  # C
+      - {expr: space:xray_flare_class:level, eval_time: 3m, exp_samples: [{labels: space:xray_flare_class:level, value: 3}]}  # M
+      - {expr: space:xray_flare_class:level, eval_time: 4m, exp_samples: [{labels: space:xray_flare_class:level, value: 4}]}  # X
+      - {expr: space:xray_flare_class:level, eval_time: 5m, exp_samples: [{labels: space:xray_flare_class:level, value: 4}]}  # clamped
+      - {expr: space:xray_flare_class:level, eval_time: 6m, exp_samples: []}  # flux 0 = data gap, not class A
+
+  - name: impossible X-ray values open a data-quality ticket
+    interval: 1m
+    input_series:
+      - series: 'swpc_xray_flux_wm2{provider="swpc", dataset="goes_xray", energy="0.1-0.8nm", satellite="18"}'
+        values: '1e-6x10 0x40'
+    alert_rule_test:
+      - alertname: UpstreamDataInvalid
+        eval_time: 30m
+        exp_alerts: []
+      - alertname: UpstreamDataInvalid
+        eval_time: 45m
+        exp_alerts:
+          - exp_labels: {severity: ticket, provider: swpc, dataset: goes_xray}
+            exp_annotations:
+              summary: swpc/goes_xray reports physically impossible values (flux = 0)
+              description: >-
+                GOES X-ray flux has been exactly 0 for 30 minutes - a data gap on the provider side
+                (satellite manoeuvre, eclipse season, calibration). Flare class is shown as "no data".
+              runbook_url: docs/runbooks.md#upstreamdatainvalid
+
+  - name: kp to G-scale
+    interval: 40m             # samples further apart than the 30m window
+    input_series:
+      - series: 'swpc_kp_estimated'
+        values: '2.33 5 6.67 9'
+    promql_expr_test:
+      - {expr: space:geomagnetic_storm:g_level, eval_time: 0m, exp_samples: [{labels: space:geomagnetic_storm:g_level, value: 0}]}
+      - {expr: space:geomagnetic_storm:g_level, eval_time: 40m, exp_samples: [{labels: space:geomagnetic_storm:g_level, value: 1}]}
+      - {expr: space:geomagnetic_storm:g_level, eval_time: 80m, exp_samples: [{labels: space:geomagnetic_storm:g_level, value: 2}]}
+      - {expr: space:geomagnetic_storm:g_level, eval_time: 120m, exp_samples: [{labels: space:geomagnetic_storm:g_level, value: 5}]}
+
+  # Real case (2026-10-10, G3 storm): the 1-minute estimate drops from 7 to 0
+  # at the start of a 3-hour synoptic period. "Current" Kp must not follow it.
+  - name: kp estimate reset at synoptic period boundary
+    interval: 1m
+    input_series:
+      - series: 'swpc_kp_estimated'
+        values: '7x10 0 0.33x20'
+    promql_expr_test:
+      - {expr: space:kp:max30m, eval_time: 15m, exp_samples: [{labels: space:kp:max30m, value: 7}]}
+      - {expr: space:geomagnetic_storm:g_level, eval_time: 15m, exp_samples: [{labels: space:geomagnetic_storm:g_level, value: 3}]}
+      # ...and the storm level decays once the reset is older than 30 minutes.
+      - {expr: space:kp:max30m, eval_time: 42m, exp_samples: [{labels: space:kp:max30m, value: 0.33}]}
+
+  - name: schema drift detection
+    interval: 1m
+    input_series:
+      - series: 'up{job="upstream", instance="swpc/kp", provider="swpc", dataset="kp_index"}'
+        values: '1x20'
+      - series: 'scrape_samples_post_metric_relabeling{job="upstream", instance="swpc/kp", provider="swpc", dataset="kp_index"}'
+        values: '2x5 0x15'
+    alert_rule_test:
+      - alertname: UpstreamSchemaDrift
+        eval_time: 10m
+        exp_alerts: []
+      - alertname: UpstreamSchemaDrift
+        eval_time: 17m
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: upstream
+              instance: swpc/kp
+              provider: swpc
+              dataset: kp_index
+            exp_annotations:
+              summary: swpc/kp returns data, but no metrics can be extracted
+              description: >-
+                The endpoint answers with HTTP 200 but json-exporter extracted (almost) nothing.
+                The payload format of swpc/kp_index has probably changed.
+              runbook_url: docs/runbooks.md#upstreamschemadrift

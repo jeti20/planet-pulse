@@ -1,0 +1,146 @@
+# json_exporter modules - turn public JSON APIs into Prometheus metrics with
+# nothing but JSONPath (Kubernetes flavour). No code, no custom poller.
+#
+# Alloy calls  /probe?module=<module>&target=<url>  and adds source labels.
+
+modules:
+
+  # ---------------------------------------------------------------- USGS ----
+  # https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php (public domain)
+  usgs_events:
+    metrics:
+      - name: usgs_feed_generated_timestamp_ms
+        help: Time the USGS feed was generated (ms since epoch). Used for the freshness SLI.
+        path: '{.metadata.generated}'
+        valuetype: gauge
+      - name: usgs_feed_events
+        help: Number of events in the feed.
+        path: '{.metadata.count}'
+        valuetype: gauge
+      - name: usgs_earthquake
+        help: One series per earthquake in the feed.
+        type: object
+        valuetype: gauge
+        path: '{.features[*]}'
+        labels:
+          id: '{.id}'
+          place: '{.properties.place}'
+          lat: '{.geometry.coordinates[1]}'
+          lon: '{.geometry.coordinates[0]}'
+        values:
+          magnitude: '{.properties.mag}'
+          depth_km: '{.geometry.coordinates[2]}'
+          time_ms: '{.properties.time}'
+          significance: '{.properties.sig}'
+          tsunami: '{.properties.tsunami}'
+
+  usgs_summary:
+    metrics:
+      - name: usgs_feed_generated_timestamp_ms
+        help: Time the USGS feed was generated (ms since epoch).
+        path: '{.metadata.generated}'
+        valuetype: gauge
+      - name: usgs_feed_events
+        help: Number of events in the feed.
+        path: '{.metadata.count}'
+        valuetype: gauge
+
+  # ----------------------------------------------------------- NOAA SWPC ----
+  # https://services.swpc.noaa.gov/ (public domain)
+  swpc_kp:
+    metrics:
+      - name: swpc_kp
+        help: Planetary K-index, 1-minute estimate (latest element of the array).
+        type: object
+        valuetype: gauge
+        path: '{[-1:]}'
+        values:
+          estimated: '{.estimated_kp}'
+          index: '{.kp_index}'
+
+  swpc_xray:
+    metrics:
+      - name: swpc_xray
+        help: GOES X-ray flux in W/m^2. 0.1-0.8nm defines the flare class (A/B/C/M/X).
+        type: object
+        valuetype: gauge
+        path: '{[-2:]}'
+        labels:
+          energy: '{.energy}'
+          satellite: '{.satellite}'
+        values:
+          flux_wm2: '{.flux}'
+
+  swpc_scales:
+    metrics:
+      - name: swpc_noaa_scale
+        help: Current NOAA space weather scales (0-5). R = radio blackout, S = solar radiation storm, G = geomagnetic storm.
+        type: object
+        valuetype: gauge
+        path: "{['0']}"
+        values:
+          r: '{.R.Scale}'
+          s: '{.S.Scale}'
+          g: '{.G.Scale}'
+
+  swpc_wind_speed:
+    metrics:
+      - name: swpc_solar_wind_speed_kms
+        help: Solar wind bulk speed at L1 (km/s).
+        path: '{[0].proton_speed}'
+        valuetype: gauge
+
+  swpc_wind_mag:
+    metrics:
+      - name: swpc_imf
+        help: Interplanetary magnetic field at L1 (nT). Strongly negative Bz drives geomagnetic storms.
+        type: object
+        valuetype: gauge
+        path: '{[0]}'
+        values:
+          bt_nt: '{.bt}'
+          bz_gsm_nt: '{.bz_gsm}'
+
+  swpc_f107:
+    metrics:
+      - name: swpc_f107_flux_sfu
+        help: 10.7 cm solar radio flux (solar flux units) - proxy for solar activity.
+        path: '{[0].flux}'
+        valuetype: gauge
+
+  # ---------------------------------------------------------- Open-Meteo ----
+  # https://open-meteo.com/ (CC BY 4.0, free for non-commercial use, < 10k calls/day)
+  openmeteo_weather:
+    metrics:
+      - name: openmeteo_weather
+        help: Current weather conditions from Open-Meteo.
+        type: object
+        valuetype: gauge
+        path: '{.current}'
+        values:
+          observed_timestamp_seconds: '{.time}'
+          temperature_celsius: '{.temperature_2m}'
+          apparent_temperature_celsius: '{.apparent_temperature}'
+          relative_humidity_percent: '{.relative_humidity_2m}'
+          wind_speed_kmh: '{.wind_speed_10m}'
+          wind_gusts_kmh: '{.wind_gusts_10m}'
+          wind_direction_degrees: '{.wind_direction_10m}'
+          pressure_hpa: '{.pressure_msl}'
+          precipitation_mm: '{.precipitation}'
+          weather_code: '{.weather_code}'
+
+  openmeteo_air:
+    metrics:
+      - name: openmeteo_air
+        help: Current air quality from the Open-Meteo / CAMS air-quality API.
+        type: object
+        valuetype: gauge
+        path: '{.current}'
+        values:
+          observed_timestamp_seconds: '{.time}'
+          pm10_ugm3: '{.pm10}'
+          pm2_5_ugm3: '{.pm2_5}'
+          nitrogen_dioxide_ugm3: '{.nitrogen_dioxide}'
+          ozone_ugm3: '{.ozone}'
+          european_aqi: '{.european_aqi}'
+          uv_index: '{.uv_index}'

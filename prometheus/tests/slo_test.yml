@@ -1,0 +1,161 @@
+# Unit tests for the SLO pipeline:  docker compose run --rm promtool test rules tests/slo_test.yml
+rule_files:
+  - ../rules/slo.yml
+
+evaluation_interval: 30s
+
+tests:
+
+  # ---------------------------------------------------------------------------
+  # Hard outage of USGS: every scrape fails. The fast-burn page must fire,
+  # Open-Meteo (healthy) must stay quiet.
+  # ---------------------------------------------------------------------------
+  - name: hard outage pages via fast burn
+    interval: 1m
+    input_series:
+      - series: 'up{job="upstream", provider="usgs", instance="usgs/2.5_day"}'
+        values: '0x180'
+      - series: 'up{job="upstream", provider="openmeteo", instance="openmeteo/weather/Poznań"}'
+        values: '1x180'
+
+    promql_expr_test:
+      - expr: slo:sli_error:ratio_rate1h
+        eval_time: 2h
+        exp_samples:
+          - labels: 'slo:sli_error:ratio_rate1h{slo="availability", provider="usgs"}'
+            value: 1
+          - labels: 'slo:sli_error:ratio_rate1h{slo="availability", provider="openmeteo"}'
+            value: 0
+      # 100% errors against a 0.5% budget = burn rate 200.
+      - expr: round(slo:burn_rate:1h{provider="usgs"})
+        eval_time: 2h
+        exp_samples:
+          - labels: '{slo="availability", provider="usgs"}'
+            value: 200
+
+    alert_rule_test:
+      - alertname: SLOErrorBudgetBurnFast
+        eval_time: 1m
+        exp_alerts: []          # still inside "for: 2m"
+      - alertname: SLOErrorBudgetBurnFast
+        eval_time: 1h
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: availability
+              provider: usgs
+            exp_annotations:
+              summary: usgs availability SLO is burning error budget fast
+              description: >-
+                Error ratio for the availability SLO of usgs is
+                100% - at this pace the whole 30-day budget is gone in
+                hours to a couple of days. Someone should look now.
+              runbook_url: docs/runbooks.md#sloerrorbudgetburnfast
+              dashboard: http://localhost:3000/d/pp-slo/slo-upstream-providers?var-provider=usgs
+
+  # ---------------------------------------------------------------------------
+  # Slow leak: 2% of scrapes fail. Burn rate 4 -> no page (needs 14.4 / 6),
+  # but a ticket (3x over 1d & 2h), and the 30d budget is gone.
+  # ---------------------------------------------------------------------------
+  - name: slow leak opens a ticket, not a page
+    interval: 1m
+    input_series:
+      - series: 'up{job="upstream", provider="swpc", instance="swpc/kp"}'
+        values: '0.98x120'
+
+    alert_rule_test:
+      - alertname: SLOErrorBudgetBurnFast
+        eval_time: 1h
+        exp_alerts: []
+      - alertname: SLOErrorBudgetBurnSlow
+        eval_time: 1h
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              slo: availability
+              provider: swpc
+            exp_annotations:
+              summary: swpc availability SLO is slowly eating its error budget
+              description: >-
+                Error ratio for the availability SLO of swpc is
+                2%. Not urgent, but the budget will run out before the end
+                of the 30-day window if nothing changes.
+              runbook_url: docs/runbooks.md#sloerrorbudgetburnslow
+              dashboard: http://localhost:3000/d/pp-slo/slo-upstream-providers?var-provider=swpc
+      - alertname: SLOErrorBudgetExhausted
+        eval_time: 1h
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              slo: availability
+              provider: swpc
+            exp_annotations:
+              summary: "swpc availability: 30-day error budget exhausted"
+              description: >-
+                The availability SLO of swpc is violated over the last 30 days.
+                Apply the error budget policy (docs/error-budget-policy.md).
+              runbook_url: docs/error-budget-policy.md
+
+  # ---------------------------------------------------------------------------
+  # Latency SLI: good = success AND duration < 1 s.
+  # ---------------------------------------------------------------------------
+  - name: latency SLI
+    interval: 1m
+    input_series:
+      - series: 'probe_success{job="synthetics", provider="usgs", instance="usgs"}'
+        values: '1x10'
+      - series: 'probe_duration_seconds{job="synthetics", provider="usgs", instance="usgs"}'
+        values: '0.4x10'
+      - series: 'probe_success{job="synthetics", provider="swpc", instance="swpc"}'
+        values: '1x10'
+      - series: 'probe_duration_seconds{job="synthetics", provider="swpc", instance="swpc"}'
+        values: '1.5x10'      # too slow
+      - series: 'probe_success{job="synthetics", provider="openmeteo", instance="openmeteo"}'
+        values: '0x10'        # fast, but failed
+      - series: 'probe_duration_seconds{job="synthetics", provider="openmeteo", instance="openmeteo"}'
+        values: '0.1x10'
+    promql_expr_test:
+      - expr: slo:sli_good:ratio{slo="latency"}
+        eval_time: 5m
+        exp_samples:
+          - labels: 'slo:sli_good:ratio{slo="latency", provider="usgs"}'
+            value: 1
+          - labels: 'slo:sli_good:ratio{slo="latency", provider="swpc"}'
+            value: 0
+          - labels: 'slo:sli_good:ratio{slo="latency", provider="openmeteo"}'
+            value: 0
+
+  # ---------------------------------------------------------------------------
+  # Freshness SLI: USGS feed must be < 5 min old. The feed below was generated
+  # at t=500 s and never updated -> fresh at t=10m, stale at t=20m.
+  # ---------------------------------------------------------------------------
+  - name: freshness SLI
+    interval: 1m
+    input_series:
+      - series: 'usgs_feed_generated_timestamp_ms{job="upstream", provider="usgs", dataset="earthquakes_m2.5_day"}'
+        values: '500000x30'
+      - series: 'openmeteo_weather_observed_timestamp_seconds{provider="openmeteo", dataset="weather", city="Poznań"}'
+        values: '0x30'        # observed at t=0, threshold 30 min
+      - series: 'openmeteo_air_observed_timestamp_seconds{provider="openmeteo", dataset="air_quality", city="Poznań"}'
+        values: '0x30'        # observed at t=0, threshold 2 h
+    promql_expr_test:
+      - expr: slo:sli_good:ratio{slo="freshness"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'slo:sli_good:ratio{slo="freshness", provider="usgs"}'
+            value: 1
+          - labels: 'slo:sli_good:ratio{slo="freshness", provider="openmeteo"}'
+            value: 1
+      - expr: slo:sli_good:ratio{slo="freshness"}
+        eval_time: 20m
+        exp_samples:
+          - labels: 'slo:sli_good:ratio{slo="freshness", provider="usgs"}'
+            value: 0
+          - labels: 'slo:sli_good:ratio{slo="freshness", provider="openmeteo"}'
+            value: 1
+      # 30 min later the weather is stale, air quality still fine -> 50%.
+      - expr: slo:sli_good:ratio{slo="freshness", provider="openmeteo"}
+        eval_time: 30m
+        exp_samples:
+          - labels: 'slo:sli_good:ratio{slo="freshness", provider="openmeteo"}'
+            value: 0.5

@@ -1,0 +1,99 @@
+# Unit tests for API usage counting:  docker compose run --rm promtool test rules tests/api_usage_test.yml
+rule_files:
+  - ../rules/api-usage.yml
+
+evaluation_interval: 1m
+
+tests:
+
+  # One scrape or probe per minute = 60 requests per hour. The air-quality
+  # endpoint fails for the second half of the window.
+  - name: every scrape, probe and Infinity query is one request
+    interval: 1m
+    input_series:
+      - series: 'up{job="upstream", provider="openmeteo", dataset="weather", instance="openmeteo/weather/Poznań"}'
+        values: '1x180'
+      - series: 'up{job="upstream", provider="openmeteo", dataset="air_quality", instance="openmeteo/air/Poznań"}'
+        values: '1x90 0x90'
+      - series: 'probe_success{job="synthetics", provider="openmeteo", instance="openmeteo"}'
+        values: '1x180'
+      - series: 'grafana_plugin_request_total{job="grafana", plugin_id="yesoreyeram-infinity-datasource", endpoint="queryData", status="ok"}'
+        values: '0+1x180'
+    promql_expr_test:
+      - expr: upstream:http_calls:count1h
+        eval_time: 2h
+        exp_samples:
+          - labels: 'upstream:http_calls:count1h{provider="openmeteo", dataset="weather", caller="json-exporter"}'
+            value: 60
+          - labels: 'upstream:http_calls:count1h{provider="openmeteo", dataset="air_quality", caller="json-exporter"}'
+            value: 60
+          - labels: 'upstream:http_calls:count1h{provider="openmeteo", dataset="synthetic_probe", caller="alloy-blackbox"}'
+            value: 60
+          - labels: 'upstream:http_calls:count1h{provider="swpc", dataset="alerts_bulletins", caller="grafana-infinity"}'
+            value: 60
+      - expr: upstream:http_calls_failed:count1h
+        eval_time: 2h
+        exp_samples:
+          - labels: 'upstream:http_calls_failed:count1h{provider="openmeteo", dataset="weather", caller="json-exporter"}'
+            value: 0
+          - labels: 'upstream:http_calls_failed:count1h{provider="openmeteo", dataset="air_quality", caller="json-exporter"}'
+            value: 30
+          - labels: 'upstream:http_calls_failed:count1h{provider="openmeteo", dataset="synthetic_probe", caller="alloy-blackbox"}'
+            value: 0
+      # 180 requests in the last hour against a limit of 5000/h.
+      - expr: upstream:api_quota_usage:ratio{window="1h"}
+        eval_time: 2h
+        exp_samples:
+          - labels: 'upstream:api_quota_usage:ratio{provider="openmeteo", window="1h"}'
+            value: 0.036
+      # 3 requests per minute against a limit of 600/min.
+      - expr: upstream:api_quota_usage:ratio{window="1m"}
+        eval_time: 2h
+        exp_samples:
+          - labels: 'upstream:api_quota_usage:ratio{provider="openmeteo", window="1m"}'
+            value: 0.005
+
+  - name: quota alert fires above 80 % of the daily limit
+    interval: 1m
+    input_series:
+      # Fed directly: generating 9000 real scrapes in a test would be silly.
+      - series: 'upstream:http_calls:count24h{provider="openmeteo", dataset="weather", caller="json-exporter"}'
+        values: '7000x10 9000x30'
+    alert_rule_test:
+      - alertname: UpstreamApiQuotaNearlyExhausted
+        eval_time: 10m
+        exp_alerts: []                       # 70 % - fine
+      - alertname: UpstreamApiQuotaNearlyExhausted
+        eval_time: 30m
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              provider: openmeteo
+              window: 1d
+            exp_annotations:
+              summary: openmeteo uses 90% of its 1d API quota
+              description: >-
+                At 100 % the provider answers HTTP 429 and its SLOs start burning. Reduce the number of
+                targets (alloy/cities.json) or increase scrape_interval in alloy/config.alloy.
+              runbook_url: docs/runbooks.md#upstreamapiquotanearlyexhausted
+
+  - name: HTTP 429 is reported as rate limiting, not as an outage
+    interval: 1m
+    input_series:
+      - series: 'probe_http_status_code{job="synthetics", provider="openmeteo", instance="openmeteo"}'
+        values: '200x5 429x10'
+      - series: 'probe_http_status_code{job="synthetics", provider="usgs", instance="usgs"}'
+        values: '200x15'
+    alert_rule_test:
+      - alertname: UpstreamRateLimited
+        eval_time: 9m
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              provider: openmeteo
+            exp_annotations:
+              summary: openmeteo is rate-limiting us (HTTP 429)
+              description: >-
+                The API quota is exhausted - this is the cause of the availability/freshness SLO burn for
+                openmeteo. See the API usage dashboard.
+              runbook_url: docs/runbooks.md#upstreamratelimited

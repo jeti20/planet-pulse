@@ -1,0 +1,321 @@
+// =============================================================================
+// Planet Pulse - Grafana Alloy pipeline
+//
+//   metrics:  upstream APIs (via json-exporter) + synthetic probes (built-in
+//             blackbox) + stack self-monitoring  -> remote_write -> Prometheus
+//   logs:     every container of this compose project -> Loki
+//             (+ log-derived metrics: log lines per service/level)
+//
+// Live component graph: http://localhost:12345
+// =============================================================================
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// -----------------------------------------------------------------------------
+// Output: everything metric-shaped ends up in Prometheus via remote_write.
+// -----------------------------------------------------------------------------
+prometheus.remote_write "prometheus" {
+  external_labels = {
+    collector = "alloy",
+  }
+
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+
+    queue_config {
+      max_samples_per_send = 2000
+    }
+  }
+}
+
+// =============================================================================
+// 1. Upstream data - Earth & space (USGS, NOAA SWPC)
+//    Every target goes through the json-exporter /probe endpoint. `provider`
+//    and `dataset` labels are what the SLOs aggregate on.
+// =============================================================================
+prometheus.scrape "upstream_space_earth" {
+  job_name        = "upstream"
+  metrics_path    = "/probe"
+  scrape_interval = "1m"
+  scrape_timeout  = "30s"
+
+  targets = [
+    {"__address__" = "json-exporter:7979", "instance" = "usgs/2.5_day", "provider" = "usgs", "dataset" = "earthquakes_m2.5_day", "__param_module" = "usgs_events", "__param_target" = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson"},
+    {"__address__" = "json-exporter:7979", "instance" = "usgs/all_hour", "provider" = "usgs", "dataset" = "earthquakes_all_hour", "__param_module" = "usgs_summary", "__param_target" = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"},
+    {"__address__" = "json-exporter:7979", "instance" = "swpc/kp", "provider" = "swpc", "dataset" = "kp_index", "__param_module" = "swpc_kp", "__param_target" = "https://services.swpc.noaa.gov/json/planetary_k_index_1m.json"},
+    {"__address__" = "json-exporter:7979", "instance" = "swpc/xray", "provider" = "swpc", "dataset" = "goes_xray", "__param_module" = "swpc_xray", "__param_target" = "https://services.swpc.noaa.gov/json/goes/primary/xrays-6-hour.json"},
+    {"__address__" = "json-exporter:7979", "instance" = "swpc/scales", "provider" = "swpc", "dataset" = "noaa_scales", "__param_module" = "swpc_scales", "__param_target" = "https://services.swpc.noaa.gov/products/noaa-scales.json"},
+    {"__address__" = "json-exporter:7979", "instance" = "swpc/wind_speed", "provider" = "swpc", "dataset" = "solar_wind_speed", "__param_module" = "swpc_wind_speed", "__param_target" = "https://services.swpc.noaa.gov/products/summary/solar-wind-speed.json"},
+    {"__address__" = "json-exporter:7979", "instance" = "swpc/wind_mag", "provider" = "swpc", "dataset" = "solar_wind_mag", "__param_module" = "swpc_wind_mag", "__param_target" = "https://services.swpc.noaa.gov/products/summary/solar-wind-mag-field.json"},
+    {"__address__" = "json-exporter:7979", "instance" = "swpc/f107", "provider" = "swpc", "dataset" = "f107", "__param_module" = "swpc_f107", "__param_target" = "https://services.swpc.noaa.gov/products/summary/10cm-flux.json"},
+  ]
+
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+}
+
+// =============================================================================
+// 2. Upstream data - weather & air quality (Open-Meteo)
+//    Cities live in cities.json (file service discovery, hot-reloaded).
+//    Relabeling turns the lat/lon labels into the API URL - no code needed.
+//    Budget: 6 cities x 2 APIs x 360 scrapes/day = 4320 calls (< 10k/day).
+// =============================================================================
+discovery.file "cities" {
+  files            = ["/etc/alloy/cities.json"]
+  refresh_interval = "1m"
+}
+
+discovery.relabel "weather" {
+  targets = discovery.file.cities.targets
+
+  rule {
+    source_labels = ["lat", "lon"]
+    separator     = ";"
+    regex         = "(.+);(.+)"
+    target_label  = "__param_target"
+    replacement   = "https://api.open-meteo.com/v1/forecast?latitude=$1&longitude=$2&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,precipitation,weather_code&timeformat=unixtime"
+  }
+  rule {
+    target_label = "__param_module"
+    replacement  = "openmeteo_weather"
+  }
+  rule {
+    source_labels = ["city"]
+    target_label  = "instance"
+    replacement   = "openmeteo/weather/$1"
+  }
+  rule {
+    target_label = "dataset"
+    replacement  = "weather"
+  }
+}
+
+discovery.relabel "air" {
+  targets = discovery.file.cities.targets
+
+  rule {
+    source_labels = ["lat", "lon"]
+    separator     = ";"
+    regex         = "(.+);(.+)"
+    target_label  = "__param_target"
+    replacement   = "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=$1&longitude=$2&current=pm10,pm2_5,nitrogen_dioxide,ozone,european_aqi,uv_index&timeformat=unixtime"
+  }
+  rule {
+    target_label = "__param_module"
+    replacement  = "openmeteo_air"
+  }
+  rule {
+    source_labels = ["city"]
+    target_label  = "instance"
+    replacement   = "openmeteo/air/$1"
+  }
+  rule {
+    target_label = "dataset"
+    replacement  = "air_quality"
+  }
+}
+
+prometheus.scrape "upstream_openmeteo" {
+  job_name        = "upstream"
+  metrics_path    = "/probe"
+  scrape_interval = "4m"
+  scrape_timeout  = "30s"
+
+  targets = array.concat(
+    discovery.relabel.weather.output,
+    discovery.relabel.air.output,
+  )
+
+  forward_to = [prometheus.relabel.openmeteo.receiver]
+}
+
+prometheus.relabel "openmeteo" {
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+
+  rule {
+    target_label = "provider"
+    replacement  = "openmeteo"
+  }
+}
+
+// =============================================================================
+// 3. Synthetic monitoring - Alloy's embedded blackbox exporter.
+//    Feeds the latency SLO and the TLS certificate expiry alert.
+// =============================================================================
+prometheus.exporter.blackbox "synthetics" {
+  config = `
+modules:
+  http_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200]
+      fail_if_not_ssl: true
+      headers:
+        User-Agent: "planet-pulse/1.0 (portfolio project; synthetic monitoring)"
+`
+
+  target {
+    name    = "usgs"
+    address = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
+    module  = "http_2xx"
+    labels  = {"provider" = "usgs"}
+  }
+
+  target {
+    name    = "swpc"
+    address = "https://services.swpc.noaa.gov/products/summary/solar-wind-speed.json"
+    module  = "http_2xx"
+    labels  = {"provider" = "swpc"}
+  }
+
+  target {
+    name    = "openmeteo"
+    address = "https://api.open-meteo.com/v1/forecast?latitude=0&longitude=0&current=temperature_2m"
+    module  = "http_2xx"
+    labels  = {"provider" = "openmeteo"}
+  }
+}
+
+// Exporter targets come with job="integrations/blackbox/<name>"; normalise
+// them to job="synthetics", instance="<provider>".
+discovery.relabel "synthetics" {
+  targets = prometheus.exporter.blackbox.synthetics.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "synthetics"
+  }
+  rule {
+    source_labels = ["provider"]
+    target_label  = "instance"
+  }
+}
+
+prometheus.scrape "synthetics" {
+  job_name        = "synthetics"
+  targets         = discovery.relabel.synthetics.output
+  scrape_interval = "1m"
+  scrape_timeout  = "15s"
+  forward_to      = [prometheus.remote_write.prometheus.receiver]
+}
+
+// =============================================================================
+// 4. Self-monitoring of the stack (meta-monitoring)
+//    Prometheus scrapes itself + Alloy directly, so it can still alert when
+//    Alloy is the thing that is broken.
+// =============================================================================
+prometheus.exporter.self "alloy" { }
+
+discovery.relabel "alloy_self" {
+  targets = prometheus.exporter.self.alloy.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "alloy"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = "alloy"
+  }
+}
+
+prometheus.scrape "alloy_self" {
+  job_name   = "alloy"
+  targets    = discovery.relabel.alloy_self.output
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+}
+
+prometheus.scrape "stack" {
+  scrape_interval = "30s"
+
+  targets = [
+    {"__address__" = "json-exporter:7979", "job" = "json-exporter"},
+    {"__address__" = "loki:3100", "job" = "loki"},
+    {"__address__" = "alertmanager:9093", "job" = "alertmanager"},
+    {"__address__" = "grafana:3000", "job" = "grafana"},
+    {"__address__" = "ntfy:80", "job" = "ntfy"},
+  ]
+
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+}
+
+// =============================================================================
+// 5. Logs - every container in the compose project -> Loki
+// =============================================================================
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=planet-pulse"]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  labels        = {"source" = "docker"}
+  forward_to    = [loki.process.containers.receiver]
+}
+
+loki.process "containers" {
+  // Almost every component in the stack logs logfmt (level=info / level=INFO).
+  stage.regex {
+    expression = `(?i)\blevel=\"?(?P<level>[a-z]+)`
+  }
+
+  stage.template {
+    source   = "level"
+    template = `{{ if .Value }}{{ ToLower .Value }}{{ else }}unknown{{ end }}`
+  }
+
+  stage.replace {
+    source     = "level"
+    expression = "(warning)"
+    replace    = "warn"
+  }
+
+  stage.labels {
+    values = {"level" = ""}
+  }
+
+  // Log-derived metric: exposed on Alloy's own /metrics as
+  // loki_process_custom_log_lines_total{service, level, ...}
+  stage.metrics {
+    metric.counter {
+      name              = "log_lines_total"
+      description       = "Log lines per service and level, derived from container logs."
+      match_all         = true
+      action            = "inc"
+      max_idle_duration = "24h"
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

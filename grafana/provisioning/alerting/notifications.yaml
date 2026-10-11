@@ -1,0 +1,95 @@
+# Grafana-managed alerting: "the planet" alerts (earthquakes, solar storms,
+# air quality). SLO / platform alerts live in Prometheus + Alertmanager.
+apiVersion: 1
+
+# ---------------------------------------------------------------- templates --
+templates:
+  - orgId: 1
+    name: planet-pulse
+    template: |
+      {{ define "pp.title" -}}
+        {{ if eq .Status "firing" }}{{ len .Alerts.Firing }} firing{{ else }}resolved{{ end }} · {{ .CommonLabels.alertname }}
+      {{- end }}
+
+      {{ define "pp.alert" -}}
+      {{ if eq .Status "firing" }}🔴{{ else }}🟢{{ end }} {{ .Annotations.summary }}
+      {{- if .Annotations.description }}
+        {{ .Annotations.description }}
+      {{- end }}
+      {{- if .Values }}
+        values: {{ range $k, $v := .Values }}{{ $k }}={{ printf "%.2f" $v }} {{ end }}
+      {{- end }}
+      {{- if .DashboardURL }}
+        dashboard: {{ .DashboardURL }}
+      {{- end }}
+      {{- if .SilenceURL }}
+        silence: {{ .SilenceURL }}
+      {{- end }}
+      {{- end }}
+
+      {{ define "pp.message" -}}
+      {{ range .Alerts.Firing }}{{ template "pp.alert" . }}
+
+      {{ end }}{{ range .Alerts.Resolved }}{{ template "pp.alert" . }}
+
+      {{ end }}
+      {{- end }}
+
+# ----------------------------------------------------------- contact points --
+contactPoints:
+  - orgId: 1
+    name: ntfy-planet
+    receivers:
+      - uid: ntfy-planet
+        type: webhook
+        settings:
+          url: http://ntfy/planet-pulse-planet?template=grafana&tags=earth_africa
+          httpMethod: POST
+          title: '{{ template "pp.title" . }}'
+          message: '{{ template "pp.message" . }}'
+        disableResolveMessage: false
+
+  - orgId: 1
+    name: ntfy-planet-urgent
+    receivers:
+      - uid: ntfy-planet-urgent
+        type: webhook
+        settings:
+          url: http://ntfy/planet-pulse-planet?template=grafana&priority=urgent&tags=warning
+          httpMethod: POST
+          title: '{{ template "pp.title" . }}'
+          message: '{{ template "pp.message" . }}'
+        disableResolveMessage: false
+
+# ---------------------------------------------------- notification policies --
+policies:
+  - orgId: 1
+    receiver: ntfy-planet
+    group_by: [grafana_folder, alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 12h
+    routes:
+      - receiver: ntfy-planet-urgent
+        object_matchers:
+          - [severity, "=", critical]
+        group_wait: 0s
+        repeat_interval: 1h
+      # Local weather and air-quality notices are not worth a buzz at night.
+      - receiver: ntfy-planet
+        object_matchers:
+          - [category, "=", weather]
+        group_by: [alertname, city]
+        mute_time_intervals: [quiet-hours]
+
+# ------------------------------------------------------------- mute timings --
+muteTimes:
+  - orgId: 1
+    name: quiet-hours
+    time_intervals:
+      - times:
+          - start_time: "22:00"
+            end_time: "24:00"
+          - start_time: "00:00"
+            end_time: "07:00"
+        location: Europe/Warsaw

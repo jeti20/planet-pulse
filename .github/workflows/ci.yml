@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: docker compose config is valid
+        run: docker compose config --quiet
+
+      - name: promtool check config + rules
+        run: docker compose run --rm promtool check config /etc/prometheus/prometheus.yml
+
+      - name: promtool unit tests (SLO burn-rate alerts, domain rules)
+        run: docker compose run --rm promtool test rules tests/slo_test.yml tests/domain_test.yml tests/api_usage_test.yml
+
+      - name: pint (PromQL linter)
+        run: docker compose run --rm pint
+
+      - name: amtool check-config
+        run: docker compose run --rm amtool
+
+      - name: alloy validate
+        run: docker compose run --rm alloy-validate
+
+      - name: dashboards are valid JSON with unique uids
+        run: |
+          set -euo pipefail
+          for f in grafana/dashboards/*/*.json; do
+            jq -e '.uid and .title and (.panels | length > 0)' "$f" > /dev/null || { echo "invalid: $f"; exit 1; }
+          done
+          dups="$(jq -r .uid grafana/dashboards/*/*.json | sort | uniq -d)"
+          test -z "$dups" || { echo "duplicate uids: $dups"; exit 1; }
+
+      - name: YAML configs parse
+        run: |
+          set -euo pipefail
+          for f in json-exporter/config.yml alloy/cities.json grafana/provisioning/*/*.yaml loki/loki.yml; do
+            yq e '.' "$f" > /dev/null || { echo "invalid: $f"; exit 1; }
+          done

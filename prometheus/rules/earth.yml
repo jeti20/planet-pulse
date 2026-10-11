@@ -1,0 +1,99 @@
+# =============================================================================
+# Domain recording rules - turn raw upstream metrics into things people ask:
+# "how many quakes today?", "how much energy?", "what flare class is it?"
+# =============================================================================
+
+groups:
+
+  - name: earthquakes
+    interval: 1m
+    rules:
+      # USGS 2.5_day feed = every M2.5+ quake of the last 24 h, one series each.
+      - record: earth:earthquakes:count24h
+        expr: count(usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"}) or vector(0)
+
+      - record: earth:earthquakes_by_class:count24h
+        expr: count(usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"} < 4.5) or vector(0)
+        labels:
+          class: M2.5-4.4
+      - record: earth:earthquakes_by_class:count24h
+        expr: count(usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"} >= 4.5 < 6) or vector(0)
+        labels:
+          class: M4.5-5.9
+      - record: earth:earthquakes_by_class:count24h
+        expr: count(usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"} >= 6 < 7) or vector(0)
+        labels:
+          class: M6.0-6.9
+      - record: earth:earthquakes_by_class:count24h
+        expr: count(usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"} >= 7) or vector(0)
+        labels:
+          class: M7+
+
+      - record: earth:earthquake_magnitude:max24h
+        expr: max(usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"})
+
+      # Radiated seismic energy, Gutenberg-Richter: log10(E[J]) = 1.5 M + 4.8
+      - record: earth:earthquake_energy_joules:sum24h
+        expr: sum(10 ^ (1.5 * usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"} + 4.8))
+
+      # ...the same in tonnes of TNT (1 t TNT = 4.184e9 J) - easier to grasp.
+      - record: earth:earthquake_energy_tnt_tonnes:sum24h
+        expr: earth:earthquake_energy_joules:sum24h / 4.184e9
+
+      # Region = the part of "place" after the last comma ("12 km SW of Hope, Alaska"
+      # -> "Alaska"); places without a comma ("Kermadec Islands region") stay as-is.
+      - record: earth:earthquakes_by_region:count24h
+        expr: |
+          count by (region) (
+            label_replace(
+              label_replace(usgs_earthquake_magnitude{dataset="earthquakes_m2.5_day"}, "region", "$1", "place", "(.+)"),
+              "region", "$1", "place", ".*, (.+)$"
+            )
+          )
+
+      # All magnitudes, last hour (USGS all_hour feed).
+      - record: earth:earthquakes:count1h
+        expr: max(usgs_feed_events{dataset="earthquakes_all_hour"})
+
+  - name: space-weather
+    interval: 1m
+    rules:
+      # GOES 0.1-0.8 nm flux -> flare class as a number:
+      #   A < 1e-7 <= B < 1e-6 <= C < 1e-5 <= M < 1e-4 <= X
+      #   0          1          2          3          4
+      # GOES sometimes reports exactly 0.0 during data gaps (log10(0) = -Inf),
+      # so zero is treated as "no data" instead of "class A".
+      - record: space:xray_flare_class:level
+        expr: clamp(floor(log10(max(swpc_xray_flux_wm2{energy="0.1-0.8nm"}) > 0)) + 8, 0, 4)
+
+      - record: space:kp:max3h
+        expr: max_over_time(swpc_kp_estimated[3h])
+
+      # "Current" Kp. The 1-minute estimate restarts from ~0 at the start of
+      # every 3-hour synoptic period (00, 03, 06 ... UTC) - during a Kp 7 storm
+      # it read 7.0 at 20:59 and 0.0 at 21:00. Taking the max over 30 minutes
+      # bridges that reset; use this series for stats and alerts.
+      - record: space:kp:max30m
+        expr: max(max_over_time(swpc_kp_estimated[30m]))
+
+      # NOAA G-scale from Kp (G1 = Kp5 ... G5 = Kp9) - cross-check with the
+      # official swpc_noaa_scale_g published by SWPC.
+      - record: space:geomagnetic_storm:g_level
+        expr: clamp_min(floor(space:kp:max30m) - 4, 0)
+
+      # Southward IMF (Bz < 0) + fast wind = energy into the magnetosphere.
+      # Rough "coupling" proxy: v * |Bz_south|, in (km/s * nT) / 1000.
+      - record: space:solar_wind_coupling:proxy
+        expr: |
+          max(swpc_solar_wind_speed_kms)
+          * on () clamp_min(-max(swpc_imf_bz_gsm_nt), 0) / 1000
+
+  - name: weather
+    interval: 1m
+    rules:
+      # How far the air quality is from the WHO 2021 24-h guideline for PM2.5 (15 ug/m3).
+      - record: city:pm2_5:who_guideline_ratio
+        expr: openmeteo_air_pm2_5_ugm3 / 15
+
+      - record: world:temperature_celsius:spread
+        expr: max(openmeteo_weather_temperature_celsius) - min(openmeteo_weather_temperature_celsius)

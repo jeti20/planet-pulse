@@ -1,0 +1,220 @@
+# =============================================================================
+# SLOs for the upstream data providers (USGS, NOAA SWPC, Open-Meteo).
+#
+# Following "The Site Reliability Workbook", ch. 2 (Implementing SLOs) and
+# ch. 5 (Alerting on SLOs):
+#
+#   SLI           = good events / valid events               (0..1)
+#   error budget  = 1 - SLO objective
+#   burn rate     = error ratio over a window / error budget
+#
+# Layout of the series (all keyed by {slo, provider}):
+#
+#   slo:sli_good:ratio                 instantaneous fraction of "good" (0..1)
+#   slo:sli_error:ratio_rate<window>   1 - avg_over_time(good[window])
+#   slo:objective:ratio                target, e.g. 0.995           (by slo)
+#   slo:error_budget:ratio             1 - objective                (by slo)
+#   slo:burn_rate:<window>             error ratio / error budget
+#   slo:error_budget_remaining:ratio   1 - (30d error ratio / budget)
+#
+# Every SLO is reduced to one "good ratio" series; the window, burn-rate and
+# budget rules below are generic and work for any SLO added later.
+# =============================================================================
+
+# Window / budget groups intentionally run at different intervals than the
+# definitions they read (30d windows are expensive), so cross-group
+# dependencies are expected here.
+# pint file/disable rule/dependency
+
+groups:
+
+  # ---------------------------------------------------------------------------
+  # SLO definitions: the only place that knows what "good" means.
+  # ---------------------------------------------------------------------------
+  - name: slo-definitions
+    interval: 30s
+    rules:
+
+      # --- Objectives (SLO targets over a rolling 30-day window) -------------
+      - record: slo:objective:ratio
+        expr: vector(0.995)
+        labels:
+          slo: availability
+      - record: slo:objective:ratio
+        expr: vector(0.99)
+        labels:
+          slo: latency
+      - record: slo:objective:ratio
+        expr: vector(0.99)
+        labels:
+          slo: freshness
+
+      - record: slo:error_budget:ratio
+        expr: 1 - slo:objective:ratio
+
+      # --- SLI 1: availability ----------------------------------------------
+      # Good event = a scrape of an upstream JSON endpoint that succeeded
+      # (HTTP 200 + parseable JSON). Measured at the real consumer, i.e. the
+      # json-exporter pipeline, not with a separate probe.
+      - record: slo:sli_good:ratio
+        expr: avg by (provider) (up{job="upstream"})
+        labels:
+          slo: availability
+
+      # --- SLI 2: latency ---------------------------------------------------
+      # Good event = synthetic probe (Alloy blackbox) that succeeded AND
+      # finished in under 1 s end to end (DNS + TCP + TLS + TTFB + transfer).
+      # (Started at 500 ms; Open-Meteo has ~5% of probes above that - see README,
+      # "Tuning the latency SLO".)
+      - record: slo:sli_good:ratio
+        expr: |
+          avg by (provider) (
+              (probe_duration_seconds{job="synthetics"} < bool 1)
+            * probe_success{job="synthetics"}
+          )
+        labels:
+          slo: latency
+
+      # --- SLI 3: freshness -------------------------------------------------
+      # Good event = the data we serve is not older than the threshold.
+      # last_over_time() keeps evaluating the last known value, so a feed that
+      # stops updating (or a scrape that keeps failing) burns freshness budget.
+      - record: slo:sli_good:ratio
+        expr: |
+          avg by (provider) (
+            (time() - last_over_time(usgs_feed_generated_timestamp_ms{dataset="earthquakes_m2.5_day"}[1d]) / 1000) < bool 300
+          )
+          or
+          avg by (provider) (
+              (time() - last_over_time(openmeteo_weather_observed_timestamp_seconds[1d]) < bool 1800)
+            or
+              (time() - last_over_time(openmeteo_air_observed_timestamp_seconds[1d]) < bool 7200)
+          )
+        labels:
+          slo: freshness
+
+  # ---------------------------------------------------------------------------
+  # Error ratios over the windows used by multi-window, multi-burn-rate alerts
+  # (SRE Workbook, table 5-8): 5m/1h, 30m/6h, 2h/1d, 6h/3d.
+  # ---------------------------------------------------------------------------
+  - name: slo-windows-short
+    interval: 30s
+    rules:
+      - record: slo:sli_error:ratio_rate5m
+        expr: 1 - avg_over_time(slo:sli_good:ratio[5m])
+      - record: slo:sli_error:ratio_rate30m
+        expr: 1 - avg_over_time(slo:sli_good:ratio[30m])
+      - record: slo:sli_error:ratio_rate1h
+        expr: 1 - avg_over_time(slo:sli_good:ratio[1h])
+      - record: slo:sli_error:ratio_rate2h
+        expr: 1 - avg_over_time(slo:sli_good:ratio[2h])
+      - record: slo:sli_error:ratio_rate6h
+        expr: 1 - avg_over_time(slo:sli_good:ratio[6h])
+
+  - name: slo-windows-long
+    interval: 2m
+    rules:
+      - record: slo:sli_error:ratio_rate1d
+        expr: 1 - avg_over_time(slo:sli_good:ratio[1d])
+      - record: slo:sli_error:ratio_rate3d
+        expr: 1 - avg_over_time(slo:sli_good:ratio[3d])
+      - record: slo:sli_error:ratio_rate30d
+        expr: 1 - avg_over_time(slo:sli_good:ratio[30d])
+
+  # ---------------------------------------------------------------------------
+  # Burn rates and error budget - what the dashboards show.
+  # ---------------------------------------------------------------------------
+  - name: slo-budget
+    interval: 1m
+    rules:
+      - record: slo:burn_rate:1h
+        expr: slo:sli_error:ratio_rate1h / on (slo) group_left () slo:error_budget:ratio
+      - record: slo:burn_rate:6h
+        expr: slo:sli_error:ratio_rate6h / on (slo) group_left () slo:error_budget:ratio
+      - record: slo:burn_rate:1d
+        expr: slo:sli_error:ratio_rate1d / on (slo) group_left () slo:error_budget:ratio
+      - record: slo:burn_rate:3d
+        expr: slo:sli_error:ratio_rate3d / on (slo) group_left () slo:error_budget:ratio
+      - record: slo:burn_rate:30d
+        expr: slo:sli_error:ratio_rate30d / on (slo) group_left () slo:error_budget:ratio
+
+      # 1 = untouched budget, 0 = budget exhausted, < 0 = SLO violated.
+      - record: slo:error_budget_remaining:ratio
+        expr: 1 - slo:burn_rate:30d
+
+  # ---------------------------------------------------------------------------
+  # Multi-window, multi-burn-rate alerts (SRE Workbook, ch. 5, "Recommended").
+  #
+  #   severity  burn  long  short  budget consumed when it fires
+  #   page      14.4  1h    5m     2%  of 30d budget
+  #   page      6     6h    30m    5%
+  #   ticket    3     1d    2h     10%
+  #   ticket    1     3d    6h     10%
+  #
+  # The short window (1/12 of the long one) makes the alert reset quickly once
+  # the problem is gone.
+  # ---------------------------------------------------------------------------
+  - name: slo-alerts
+    interval: 30s
+    rules:
+      - alert: SLOErrorBudgetBurnFast
+        expr: |
+          (
+              slo:sli_error:ratio_rate1h > on (slo) group_left () (14.4 * slo:error_budget:ratio)
+            and
+              slo:sli_error:ratio_rate5m > on (slo) group_left () (14.4 * slo:error_budget:ratio)
+          )
+          or
+          (
+              slo:sli_error:ratio_rate6h > on (slo) group_left () (6 * slo:error_budget:ratio)
+            and
+              slo:sli_error:ratio_rate30m > on (slo) group_left () (6 * slo:error_budget:ratio)
+          )
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.provider }} {{ $labels.slo }} SLO is burning error budget fast"
+          description: >-
+            Error ratio for the {{ $labels.slo }} SLO of {{ $labels.provider }} is
+            {{ $value | humanizePercentage }} - at this pace the whole 30-day budget is gone in
+            hours to a couple of days. Someone should look now.
+          runbook_url: docs/runbooks.md#sloerrorbudgetburnfast
+          dashboard: http://localhost:3000/d/pp-slo/slo-upstream-providers?var-provider={{ $labels.provider }}
+
+      - alert: SLOErrorBudgetBurnSlow
+        expr: |
+          (
+              slo:sli_error:ratio_rate1d > on (slo) group_left () (3 * slo:error_budget:ratio)
+            and
+              slo:sli_error:ratio_rate2h > on (slo) group_left () (3 * slo:error_budget:ratio)
+          )
+          or
+          (
+              slo:sli_error:ratio_rate3d > on (slo) group_left () (1 * slo:error_budget:ratio)
+            and
+              slo:sli_error:ratio_rate6h > on (slo) group_left () (1 * slo:error_budget:ratio)
+          )
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.provider }} {{ $labels.slo }} SLO is slowly eating its error budget"
+          description: >-
+            Error ratio for the {{ $labels.slo }} SLO of {{ $labels.provider }} is
+            {{ $value | humanizePercentage }}. Not urgent, but the budget will run out before the end
+            of the 30-day window if nothing changes.
+          runbook_url: docs/runbooks.md#sloerrorbudgetburnslow
+          dashboard: http://localhost:3000/d/pp-slo/slo-upstream-providers?var-provider={{ $labels.provider }}
+
+      - alert: SLOErrorBudgetExhausted
+        expr: slo:error_budget_remaining:ratio <= 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.provider }} {{ $labels.slo }}: 30-day error budget exhausted"
+          description: >-
+            The {{ $labels.slo }} SLO of {{ $labels.provider }} is violated over the last 30 days.
+            Apply the error budget policy (docs/error-budget-policy.md).
+          runbook_url: docs/error-budget-policy.md

@@ -1,0 +1,62 @@
+# Alertmanager - routes Prometheus alerts (SLO burn rates, meta-monitoring)
+# to ntfy (self-hosted push notifications, web UI on http://localhost:8080).
+
+route:
+  receiver: ntfy-tickets
+  group_by: [alertname, provider, slo]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+  routes:
+    # Dead man's switch heartbeat - its own topic, re-sent every hour.
+    - matchers: [alertname = "Watchdog"]
+      receiver: ntfy-heartbeat
+      group_wait: 0s
+      repeat_interval: 1h
+
+    - matchers: [severity = "page"]
+      receiver: ntfy-pages
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # Tickets are not urgent: deliver them only during working hours.
+    - matchers: [severity = "ticket"]
+      receiver: ntfy-tickets
+      active_time_intervals: [working-hours]
+
+receivers:
+  - name: ntfy-pages
+    webhook_configs:
+      - url: http://ntfy/planet-pulse-pages?template=alertmanager&priority=urgent&tags=rotating_light
+        send_resolved: true
+  - name: ntfy-tickets
+    webhook_configs:
+      - url: http://ntfy/planet-pulse-tickets?template=alertmanager&priority=default&tags=ticket
+        send_resolved: true
+  - name: ntfy-heartbeat
+    webhook_configs:
+      - url: http://ntfy/planet-pulse-heartbeat?template=alertmanager&priority=min&tags=heartbeat
+        send_resolved: false
+
+inhibit_rules:
+  # A page already covers the same SLO - don't also open a ticket for it.
+  - source_matchers: [severity = "page"]
+    target_matchers: [severity = "ticket"]
+    equal: [provider, slo]
+
+  # If no data reaches Prometheus at all, per-upstream symptoms are noise.
+  - source_matchers: [alertname = "NoUpstreamDataReceived"]
+    target_matchers: [alertname =~ "UpstreamScrapeFailing|UpstreamSchemaDrift|SLOErrorBudgetBurn.*"]
+
+  # json-exporter down => every upstream scrape fails; report the cause only.
+  - source_matchers: [alertname = "StackComponentDown", job = "json-exporter"]
+    target_matchers: [alertname =~ "UpstreamScrapeFailing|UpstreamSchemaDrift"]
+
+time_intervals:
+  - name: working-hours
+    time_intervals:
+      - weekdays: ["monday:friday"]
+        times:
+          - start_time: "08:00"
+            end_time: "18:00"
+        location: Europe/Warsaw
