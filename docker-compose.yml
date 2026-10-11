@@ -162,7 +162,7 @@ services:
       - ./alertmanager:/etc/alertmanager:ro
 
   pint:
-    image: ghcr.io/cloudflare/pint:0.89.0
+    image: ghcr.io/cloudflare/pint:0.89.2
     profiles: [tools]
     command: ["pint", "--config=/work/.pint.hcl", "--no-color", "lint", "/work/prometheus/rules"]
     volumes:
