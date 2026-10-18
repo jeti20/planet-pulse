@@ -87,7 +87,7 @@ services:
     logging: *logging
 
   ntfy:
-    image: binwiederhier/ntfy:v2.29.0
+    image: binwiederhier/ntfy:v2.30.0
     command: ["serve"]
     environment:
       NTFY_BASE_URL: http://localhost:8080
